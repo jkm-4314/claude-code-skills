@@ -12,6 +12,8 @@ allowed-tools:
 
 # Multi-Model Review
 
+> 📦 This skill is also part of a larger collection: **[claude-code-skills](https://github.com/jkm-4314/claude-code-skills)** — project bootstrap, persistent session memory, and multi-model review. Clone the repo if you want all of them.
+
 Orchestrate iterative review of specs or code by Codex (GPT-5.5) until both Claude and Codex agree the work is production-ready.
 
 ## Installation
