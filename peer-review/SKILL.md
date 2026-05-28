@@ -1,6 +1,6 @@
 ---
-name: multi-model-review
-description: Use when Claude completes a spec or code implementation and needs independent review, or when the user invokes /multi-model-review. Triggers automatically after spec writing or code completion for production projects. Only bypass when user explicitly opts out.
+name: peer-review
+description: Use when Claude completes a spec or code implementation and needs independent review, or when the user invokes /peer-review. Triggers automatically after spec writing or code completion for production projects. Only bypass when user explicitly opts out.
 allowed-tools:
   - Bash
   - Read
@@ -10,9 +10,9 @@ allowed-tools:
   - Grep
 ---
 
-# Multi-Model Review
+# Peer Review
 
-> 📦 This skill is also part of a larger collection: **[claude-code-skills](https://github.com/jkm-4314/claude-code-skills)** — project bootstrap, persistent session memory, and multi-model review. Clone the repo if you want all of them.
+> 📦 This skill is also part of a larger collection: **[claude-code-skills](https://github.com/jkm-4314/claude-code-skills)** — project bootstrap, persistent session memory, and peer review. Clone the repo if you want all of them.
 
 Orchestrate iterative review of specs or code by Codex (GPT-5.5) until both Claude and Codex agree the work is production-ready.
 
@@ -24,21 +24,21 @@ Orchestrate iterative review of specs or code by Codex (GPT-5.5) until both Clau
    - Run `codex --version` to verify
 
 2. **Install the skill:**
-   - Save this `SKILL.md` to `~/.claude/skills/multi-model-review/SKILL.md` (Linux/macOS) or `%USERPROFILE%\.claude\skills\multi-model-review\SKILL.md` (Windows)
+   - Save this `SKILL.md` to `~/.claude/skills/peer-review/SKILL.md` (Linux/macOS) or `%USERPROFILE%\.claude\skills\peer-review\SKILL.md` (Windows)
    - Restart Claude Code, or start a new session, so the skill is discovered
 
 3. **Optional — slash command:**
-   - Invoke explicitly with `/multi-model-review spec` or `/multi-model-review code`
+   - Invoke explicitly with `/peer-review spec` or `/peer-review code`
    - Otherwise the skill triggers automatically after spec writing or code completion (unless the user opts out)
 
-4. **Verify:** Ask Claude "run the multi-model-review skill on this spec" and confirm Codex is invoked.
+4. **Verify:** Ask Claude "run the peer-review skill on this spec" and confirm Codex is invoked.
 
 ## Modes
 
 - **spec** — Review a specification document
 - **code** — Review code changes (git diff)
 
-Determine mode from context or from the argument passed (e.g., `/multi-model-review spec`).
+Determine mode from context or from the argument passed (e.g., `/peer-review spec`).
 
 ## Bypass
 
@@ -94,14 +94,14 @@ Scope rules:
 Create the log file in a private temp directory:
 
 ```bash
-REVIEW_DIR=$(mktemp -d "${TMPDIR:-/tmp}/multi-model-review-XXXXXX")
+REVIEW_DIR=$(mktemp -d "${TMPDIR:-/tmp}/peer-review-XXXXXX")
 REVIEW_LOG="$REVIEW_DIR/review-log.md"
 ```
 
 Write the header:
 
 ```markdown
-# Multi-Model Review Log
+# Peer Review Log
 - Mode: <spec|code>
 - Target: <file path or diff description>
 - Started: <ISO timestamp>
@@ -110,6 +110,20 @@ Write the header:
 ### Step 3: Invoke Codex Review (Loop)
 
 For each round (max 5):
+
+**3a-prep. Pre-round self-check (rounds 2+ only).**
+
+Before invoking Codex on round 2 or later, Claude MUST:
+
+1. List the concepts, names, paths, or section titles that were renamed/replaced/moved during the prior round's remediation.
+2. Grep the artifact for each old name. For each remaining reference, decide whether it is:
+   - A genuine stale reference → fix it now.
+   - An intentional historical mention (e.g., changelog, migration comment) → leave it; note in inventory.
+3. Build the SECTIONS MODIFIED SINCE LAST ROUND inventory: a bullet list of section titles / file paths / line ranges that changed since the previous round, each with a one-line summary. This will be embedded in the PRIOR REVIEW CONTEXT block.
+
+Rationale: catching obvious mechanical regressions (stale refs, broken cross-links, missed renames) before invoking Codex prevents wasting a full review round on cleanup that doesn't need a second opinion.
+
+If the prior round was a disagreement-only round (no remediation applied), state "No remediations applied this round." in the inventory and skip the grep step.
 
 **3a. Build the prompt.**
 
@@ -120,9 +134,10 @@ PROMPT_FILE="$REVIEW_DIR/prompt-round-N.txt"
 ```
 
 The prompt MUST include these elements in order:
-1. The SPEC_PROMPT or CODE_PROMPT template (see below)
-2. On rounds 2+: the PRIOR REVIEW CONTEXT block
-3. The instruction to read the target file or run git diff
+1. The ROUND_FOCUS block matching the current round number (round 1, 2, 3–4, or 5)
+2. The SPEC_PROMPT or CODE_PROMPT template (see below)
+3. On rounds 2+: the PRIOR REVIEW CONTEXT block, with the SECTIONS MODIFIED SINCE LAST ROUND inventory built in 3a-prep substituted in
+4. The instruction to read the target file or run git diff
 
 **3b. Invoke Codex via stdin.**
 
@@ -154,8 +169,9 @@ If `codex exec` exits non-zero or the output file is missing/empty:
 
 Find the final non-empty line of output and match exactly:
 - If the final non-empty line is exactly `FINAL VERDICT: NO-GO` → NO-GO
+- If the final non-empty line is exactly `FINAL VERDICT: CONDITIONAL-GO` → CONDITIONAL-GO
 - If the final non-empty line is exactly `FINAL VERDICT: GO` → GO
-- If the final line does not match either pattern → fail closed as NO-GO ("Codex did not provide a clear verdict; treating as NO-GO")
+- If the final line does not match any pattern → fail closed as NO-GO ("Codex did not provide a clear verdict; treating as NO-GO")
 - Ignore any verdict-like strings elsewhere in the output — only the final line counts
 
 **3e. Report to user.**
@@ -168,9 +184,21 @@ Append the round's Codex feedback to `$REVIEW_LOG`. When logging, paraphrase any
 
 **3g. If verdict is GO:** Proceed to Step 4.
 
-**3h. If verdict is NO-GO:**
+**3h. If verdict is CONDITIONAL-GO:**
 
-- Analyze each issue by severity (CRITICAL > MAJOR > MINOR)
+CONDITIONAL-GO means Codex judges remaining issues non-blocking and ship-with-caveats. Claude MUST:
+
+1. Capture the remaining findings verbatim (preserving Codex's `[SEVERITY/PRIORITY]` tags) into a "Known Open Issues" section inside the artifact:
+   - **Spec mode:** append a `## Known Open Issues` section near the bottom of the spec, before any appendices.
+   - **Code mode:** append findings as TODO comments at the relevant call sites, OR file them as tickets and reference the ticket IDs in a top-of-PR comment.
+2. Validate that none of the captured findings are tagged `BLOCKING`. If any BLOCKING finding is present, treat the verdict as NO-GO instead and fall through to step 3i — CONDITIONAL-GO with a BLOCKING finding is a Codex output error, not a valid exit.
+3. Report to the user: the verdict, the count of caveats by priority, and the path to where they were captured.
+4. Append Claude's caveat-capture summary to `$REVIEW_LOG`.
+5. Proceed to Step 4 (Claude self-check). The review loop ends; CONDITIONAL-GO does NOT trigger another round.
+
+**3i. If verdict is NO-GO:**
+
+- Analyze each issue by severity (CRITICAL > MAJOR > MINOR) and deploy priority (BLOCKING > DESIRED > POLISH)
 - Perform remediation: edit the spec or code to address each issue
 - Explain to the user what was changed and why
 - **Code mode only:** After remediation, re-run the project's verification suite (tests, lint, type-check). If verification fails, fix the regression before proceeding to the next review round.
@@ -180,12 +208,15 @@ Append the round's Codex feedback to `$REVIEW_LOG`. When logging, paraphrase any
 
 ### Step 4: Claude Self-Check
 
-After Codex issues GO, Claude MUST independently verify:
-- Do I agree this is production-ready?
+After Codex issues GO or CONDITIONAL-GO, Claude MUST independently verify:
+- Do I agree this is production-ready (or, for CONDITIONAL-GO, ready-to-ship-with-caveats)?
 - Are there issues I see that Codex missed?
 - Am I confident in the remediations I made?
+- For CONDITIONAL-GO: are the captured caveats accurately reflected in the artifact's "Known Open Issues" section, with no BLOCKING items hiding among them?
 
-If Claude agrees → report "Both models independently agree this is production-ready." and proceed to cleanup.
+If Claude agrees:
+- GO → report "Both models independently agree this is production-ready." and proceed to cleanup.
+- CONDITIONAL-GO → report "Both models independently agree this is ready to ship with N caveats. Caveats captured at <path>." and proceed to cleanup.
 
 If Claude disagrees → report the disagreement to the user with specific concerns. Ask user to adjudicate.
 
@@ -199,7 +230,9 @@ rm -rf "$REVIEW_DIR"
 
 If session is interrupted (crash, context overflow), files in `$TMPDIR` are subject to OS-level temp cleanup. Review logs contain only review metadata and quoted code — never credentials or secrets.
 
-### Step 6: Circuit Breaker (5 rounds without GO)
+### Step 6: Circuit Breaker (5 rounds without GO or CONDITIONAL-GO)
+
+The round-5 prompt actively encourages CONDITIONAL-GO over NO-GO when remaining issues are non-architectural and inline-fixable, so reaching the circuit breaker should be rare. The breaker only fires when Codex returns NO-GO on round 5 — i.e., genuine deploy-blocking disagreement.
 
 If round 5 completes with NO-GO, **Claude's position prevails automatically** — the task continues without blocking:
 
@@ -255,11 +288,31 @@ Review this specification with the rigor of a principal engineer at a top-tier o
 
 Do not skim. Do not hand-wave. Treat every section as potentially containing a critical defect. If something is unclear, flag it as a blocking issue rather than assuming charitable interpretation.
 
+SEVERITY DEFINITIONS — apply strictly. Severity floor must NOT drift downward across rounds.
+- CRITICAL: the system fails in production, loses data, exposes security, or violates a stated contract. State the user-visible failure when assigning this severity.
+- MAJOR: a documented behavior is wrong; a stated invariant is unverifiable; a non-trivial implementation gap remains.
+- MINOR: documentation drift, stale references, formatting, examples that don't match canonical types, polish.
+
 You MUST end your response with EXACTLY one of these lines (no other text on that line):
 FINAL VERDICT: GO
+FINAL VERDICT: CONDITIONAL-GO
 FINAL VERDICT: NO-GO
 
-If NO-GO, list each issue above the verdict with severity (CRITICAL/MAJOR/MINOR) and specific remediation guidance.
+CONDITIONAL-GO is appropriate when ALL of the following hold:
+- Remaining findings could be addressed in fewer than ~10 inline edits.
+- No remaining finding would change the architecture, data model, or public contract.
+- No remaining finding is BLOCKING (see priority tags below).
+The author will record the remaining findings as a "Known Open Issues" caveat list inside the artifact and ship.
+
+If NO-GO or CONDITIONAL-GO, list each issue above the verdict with severity, deploy priority, and specific remediation. Format:
+`[SEVERITY/PRIORITY] <one-line issue> — <specific remediation>`
+
+Deploy-priority tags:
+- BLOCKING — must remediate before any production deploy
+- DESIRED — should remediate; safe to defer one PR if scope is large
+- POLISH — documentation, examples, stale references; ship anyway if low-risk
+
+Example: `[MAJOR/DESIRED] POST /foo lacks rate limit — wire existing middleware at 10/min`.
 ```
 
 ### CODE_PROMPT
@@ -283,11 +336,31 @@ Review this code with the rigor of a principal engineer at a top-tier organizati
 
 Do not skim. Do not hand-wave. Treat every function as potentially containing a critical defect. If behavior is ambiguous, flag it as a blocking issue rather than assuming charitable interpretation.
 
+SEVERITY DEFINITIONS — apply strictly. Severity floor must NOT drift downward across rounds.
+- CRITICAL: the system fails in production, loses data, exposes security, or violates a stated contract. State the user-visible failure when assigning this severity.
+- MAJOR: a documented behavior is wrong; a stated invariant is unverifiable; a non-trivial implementation gap remains.
+- MINOR: documentation drift, stale references, formatting, examples that don't match canonical types, polish.
+
 You MUST end your response with EXACTLY one of these lines (no other text on that line):
 FINAL VERDICT: GO
+FINAL VERDICT: CONDITIONAL-GO
 FINAL VERDICT: NO-GO
 
-If NO-GO, list each issue above the verdict with severity (CRITICAL/MAJOR/MINOR) and specific remediation guidance.
+CONDITIONAL-GO is appropriate when ALL of the following hold:
+- Remaining findings could be addressed in fewer than ~10 inline edits.
+- No remaining finding would change the architecture, data model, or public contract.
+- No remaining finding is BLOCKING (see priority tags below).
+The author will record the remaining findings as a "Known Open Issues" caveat list inside the artifact (or as TODO comments / ticket references for code) and ship.
+
+If NO-GO or CONDITIONAL-GO, list each issue above the verdict with severity, deploy priority, and specific remediation. Format:
+`[SEVERITY/PRIORITY] <one-line issue> — <specific remediation>`
+
+Deploy-priority tags:
+- BLOCKING — must remediate before any production deploy
+- DESIRED — should remediate; safe to defer one PR if scope is large
+- POLISH — documentation, examples, stale references; ship anyway if low-risk
+
+Example: `[MAJOR/DESIRED] handler swallows exceptions silently — log + re-raise so request fails fast`.
 ```
 
 ### PRIOR REVIEW CONTEXT (prepend on rounds 2+)
@@ -305,9 +378,72 @@ The reviewer (Claude) DISAGREED with the following findings and did not remediat
 <list any disagreements, or "None">
 --- END PRIOR ROUND SUMMARY ---
 
-Focus your review on:
-1. Whether the remediations are correct and complete
-2. Any NEW issues not previously identified
-3. Whether prior fixes introduced regressions
-4. Whether you maintain your position on disputed findings (provide additional reasoning if so)
+SECTIONS MODIFIED SINCE LAST ROUND:
+<bullet list of sections / files / line ranges that changed since the last round, each with a one-line summary of what changed. Generated by Claude during pre-round self-check. If no remediation was performed (e.g., disagreement-only round), state "No remediations applied this round.">
+
+PRIMARY REVIEW TARGET (delta focus):
+The remediations claimed in the prior summary above are your PRIMARY review target. For each claim:
+1. Confirm the change actually landed in the current artifact.
+2. Check whether the change introduced regressions in adjacent sections (stale references to renamed concepts, broken cross-links, contradictions with unchanged sections).
+3. Verify that the fix addresses the root cause, not just the symptom.
+
+Open-ended new findings remain welcome, but prioritize remediation verification first. Do not re-raise issues that were already resolved unless you can show the resolution is incorrect or incomplete.
+
+Maintain severity discipline — a stale comment in a migration is MINOR, not MAJOR. Re-read the SEVERITY DEFINITIONS in the base prompt before assigning severity.
+
+Also evaluate:
+- Whether you maintain your position on disputed findings (provide additional reasoning if so).
+- Whether the artifact is ready for CONDITIONAL-GO: are remaining issues small enough to ship as a caveat list?
+```
+
+### ROUND_FOCUS (prepend on every round)
+
+The review's natural arc shifts each round. Prepend the matching block to the prompt to direct attention.
+
+**Round 1:**
+
+```
+ROUND FOCUS — Round 1 of up to 5.
+This is the first read. Cast a wide net. Prioritize:
+- Architecture, data model, public contracts.
+- Security baseline (authn/authz, input validation, secrets handling, OWASP class issues).
+- Stated invariants and whether they're verifiable.
+- Stability (transactional boundaries, error paths, resource lifecycle).
+Catch the structural defects now — later rounds are more expensive.
+```
+
+**Round 2:**
+
+```
+ROUND FOCUS — Round 2 of up to 5.
+Round 1 surfaced the obvious architectural issues. The author has remediated. Your focus this round:
+- Cross-cutting concerns introduced or exposed by round-1 fixes (idempotency, audit, concurrency, transactional ordering, ETag/lock semantics).
+- Second-order effects: did fixing X create a new gap at Y?
+- Sequencing of migrations / deploys / rollouts.
+Stay vigilant on architecture but expect smaller issues than round 1.
+```
+
+**Rounds 3–4:**
+
+```
+ROUND FOCUS — Round N of up to 5.
+The architecture has stabilized. Your primary value this round is catching remediation regressions:
+- Stale references to renamed concepts.
+- Bypass routes that were forgotten when a new path was locked down.
+- Sequencing violations introduced by reorderings.
+- Migration logic correctness on the specific data paths the prior round flagged.
+Open-ended new findings are welcome but should clear a higher bar — they cost a full extra round to remediate.
+```
+
+**Round 5:**
+
+```
+ROUND FOCUS — Round 5 of up to 5 (final round before circuit breaker).
+This is the LAST round. After this, the loop ends regardless of verdict.
+
+Your decision is not "is everything perfect" — it is "is the artifact production-ready or close enough to ship with caveats."
+
+Strongly prefer CONDITIONAL-GO over NO-GO if remaining findings are inline-fixable and non-architectural. NO-GO at this stage means the work ships with Claude's position prevailing automatically; CONDITIONAL-GO is a transparent middle path that captures your remaining concerns as a known-issues list.
+
+Reserve NO-GO for findings that are genuinely deploy-blocking — issues you would refuse to merge in a real PR review at a top-tier organization.
 ```
